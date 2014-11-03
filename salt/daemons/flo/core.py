@@ -14,6 +14,7 @@ import multiprocessing
 import traceback
 import itertools
 from collections import deque
+import random
 
 # Import salt libs
 import salt.daemons.masterapi
@@ -182,6 +183,7 @@ class SaltRaetRoadStackSetup(ioflo.base.deeding.Deed):
         if self.opts.value.get('raet_clear_remotes'):
             for remote in self.stack.value.remotes.values():
                 self.stack.value.removeRemote(remote, clear=True)
+            self.stack.puid = self.stack.value.Uid  # reset puid
 
 
 class SaltRaetRoadStackCloser(ioflo.base.deeding.Deed):
@@ -274,7 +276,8 @@ class SaltRaetRoadStackJoined(ioflo.base.deeding.Deed):
         joined = False
         if stack and isinstance(stack, RoadStack):
             if stack.remotes:
-                joined = stack.remotes.values()[0].joined
+                for remote in stack.remotes.values():
+                    joined = any([remote.joined for remote in stack.remotes.values()])
         self.status.update(joined=joined)
 
 
@@ -360,7 +363,8 @@ class SaltRaetRoadStackAllowed(ioflo.base.deeding.Deed):
         allowed = False
         if stack and isinstance(stack, RoadStack):
             if stack.remotes:
-                allowed = stack.remotes.values()[0].allowed
+                for remote in stack.remotes.values():
+                    allowed = any([remote.allowed for remote in stack.remotes.values()])
         self.status.update(allowed=allowed)
 
 
@@ -520,10 +524,22 @@ class SaltLoadPillar(ioflo.base.deeding.Deed):
         '''
         Initial pillar
         '''
-        # default master is the first remote
-        # this default destination will not work with multiple masters
+        # default master is the first remote that is allowed
+        available_masters = [remote for remote in self.road_stack.value.remotes.values()
+                                               if remote.allowed]
+        while not available_masters:
+            available_masters = [remote for remote in self.road_stack.value.remotes.values()
+                                                           if remote.allowed]
+            time.sleep(0.1)
+
+        random_master = self.opts.value.get('random_master')
+        if random_master:
+            master = available_masters[random.randint(0, len(available_masters) - 1)]
+        else:
+            master = available_masters[0]
+
         route = {'src': (self.road_stack.value.local.name, None, None),
-                 'dst': (self.road_stack.value.remotes.values()[0].name, None, 'remote_cmd')}
+                 'dst': (master.name, None, 'remote_cmd')}
         load = {'id': self.opts.value['id'],
                 'grains': self.grains.value,
                 'saltenv': self.opts.value['environment'],
@@ -881,17 +897,30 @@ class SaltRaetRouter(ioflo.base.deeding.Deed):
             if not self.road_stack.value.remotes:
                 log.error("Missing joined master. Unable to route "
                           "remote_cmd '{0}'.".format(msg))
+                return
+            #log.error("**** Missing destination estate for 'remote_cmd'. Unable to route "
+                                    #"remote_cmd '{0}'.".format(msg))
+            #return
             d_estate = self.road_stack.value.remotes.values()[0].name
             msg['route']['dst'] = (d_estate, d_yard, d_share)
+            log.error("**** Missing destination estate for 'remote_cmd'. "
+                    "Using default route={0}.".format(msg['route']['dst']))
             self.road_stack.value.message(msg,
                     self.road_stack.value.nameRemotes[d_estate].uid)
-        elif d_share == 'call_cmd':  # salt call minion to master
+        elif d_share == 'call_cmd':  # salt call return pub to master
             if not self.road_stack.value.remotes:
                 log.error("Missing joined master. Unable to route "
                           "call_cmd '{0}'.".format(msg))
+                return
+            #log.error("**** Missing destination estate for 'call_cmd'. Unable to route "
+                                                #"call_cmd '{0}'.".format(msg))
+            #return
+
             d_estate = self.road_stack.value.remotes.values()[0].name
             d_share = 'remote_cmd'
             msg['route']['dst'] = (d_estate, d_yard, d_share)
+            log.error("**** Missing destination estate for 'call_cmd'. "
+                        "Using default route={0}.".format(msg['route']['dst']))
             self.road_stack.value.message(msg,
                     self.road_stack.value.nameRemotes[d_estate].uid)
 
@@ -1136,6 +1165,10 @@ class SaltRaetNixJobber(ioflo.base.deeding.Deed):
         salt.utils.daemonize_if(self.opts)
 
         salt.transport.jobber_stack = stack = self._setup_jobber_stack()
+        # set up return destination from source
+        src_estate, src_yard, src_share = msg['route']['src']
+        salt.transport.jobber_estate_name = src_estate
+        salt.transport.jobber_yard_name = src_yard
 
         sdata = {'pid': os.getpid()}
         sdata.update(data)
